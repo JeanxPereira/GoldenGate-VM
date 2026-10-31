@@ -191,7 +191,7 @@ external/               submodules (Orchard, metal2vulkan) and PINNED
 
 ## Credits
 
-- **[Orchard](https://github.com/yaelliethy/orchard)** by Youssef Elliethy (yaelliethy): QEMU
+- **[Orchard](https://github.com/yaelliethy/orchard)** by yaelliethy: QEMU
   `vmapple` on TCG, the tart image fetcher, AVPBooter extraction, and the integration of
   reims-vgpu into QEMU. This project is built on it.
 - **[reims-vgpu](https://github.com/steelbrain/reims-vgpu)** and
