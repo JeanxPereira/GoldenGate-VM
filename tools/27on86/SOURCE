@@ -1,0 +1,5 @@
+From steelbrain/experiment-macOS-arm64-on-linux-x86 (branch vmapple-tcg @509a4ce),
+scripts/27on86/. That repository is a QEMU tree and these files carry no licence header,
+so QEMU's rule for such files applies: GPL-2.0-or-later.
+Local change: HANDOFF_PC is read from QEMU_27ON86_HANDOFF_PC (macOS 27 uses 0xE0A00000).
+Local change: accepts boot_args revision 3 (macOS 27; same offsets up to CommandLine @108).

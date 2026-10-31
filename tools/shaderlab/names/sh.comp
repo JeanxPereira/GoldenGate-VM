@@ -1,0 +1,10 @@
+#version 450
+layout(local_size_x = 20, local_size_y = 20) in;
+layout(set = 0, binding = 0) buffer B { float d[]; } buf;
+shared vec2 NAMEPLACEHOLDER[400];
+void main() {
+  uint i = gl_LocalInvocationIndex;
+  NAMEPLACEHOLDER[i] = vec2(buf.d[gl_GlobalInvocationID.x], 1.0);
+  barrier();
+  buf.d[gl_GlobalInvocationID.x] = NAMEPLACEHOLDER[399 - i].x;
+}

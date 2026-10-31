@@ -1,0 +1,11 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) buffer B { float d[]; } buf;
+struct STRUCTPLACEHOLDER { vec2 a; float b; };
+shared STRUCTPLACEHOLDER cache[256];
+void main() {
+  uint i = gl_LocalInvocationIndex;
+  cache[i].a = vec2(buf.d[gl_GlobalInvocationID.x], 1.0); cache[i].b = 2.0;
+  barrier();
+  buf.d[gl_GlobalInvocationID.x] = cache[255 - i].a.x + cache[i ^ 1].b;
+}

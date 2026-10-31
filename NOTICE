@@ -1,0 +1,40 @@
+GoldenGate-VM
+=============
+
+The scripts, tools and documents in this repository (everything outside external/) are
+licensed GPL-2.0-or-later; the full text is in LICENSE. This matches QEMU, which they drive.
+
+Exceptions inside this repository
+---------------------------------
+tools/27on86/  apple_device_tree.py, inject-xnu-boot-args.gdb, dump-boot-args.gdb and
+               serial-command.py come from steelbrain/experiment-macOS-arm64-on-linux-x86
+               (branch vmapple-tcg @509a4ce, scripts/27on86/), a QEMU tree. They carry no
+               licence header, so QEMU's LICENSE rule applies: GPL-2.0-or-later. Local changes
+               are listed in tools/27on86/SOURCE.
+
+Submodules (external/), each under its own licence
+---------------------------------------------------
+external/orchard        Fork of yaelliethy/orchard (branch gg-macos27).
+  qemu/                 QEMU: GPL-2.0-only as a whole, with parts under compatible licences
+                        (qemu/LICENSE, qemu/COPYING, qemu/COPYING.LIB). Orchard's changes and
+                        ours: GPL-2.0-or-later.
+  reims-vgpu/           steelbrain/reims-vgpu with Orchard's and our changes. reims-vgpu/LICENSE
+                        is LGPL-3.0; note that the crate manifests (crates/*/Cargo.toml) declare
+                        "GPL-2.0-or-later". Both come from upstream; see their repositories.
+  ATTRIBUTION.md, LICENSE-NOTICE.md
+                        Orchard's own notices (QEMU, reims-vgpu, NyanSatan's Virtual-iBoot-Fun,
+                        and the Inferno-derived PAC code since removed).
+external/metal2vulkan   Fork of steelbrain/metal2vulkan (branch gg-macos27): LGPL-3.0-or-later
+                        (LICENSE, Cargo.toml).
+
+Third-party work this project depends on but does not include
+--------------------------------------------------------------
+- Mesa (kisak-mesa PPA builds), downloaded by the user: MIT and other licences, see Mesa.
+- apfs-fuse (sgan81), built by the user: GPL-2.0.
+- The AVPBooter patch site/technique: NyanSatan, Virtual-iBoot-Fun.
+
+Apple software
+--------------
+No Apple software, firmware or image is distributed here. The macOS image, its NVRAM and the
+AVPBooter firmware are fetched or extracted by the user on their own machine, under the terms
+that apply to them. Screenshots in docs/img show the guest's own UI for documentation.

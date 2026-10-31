@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Run a command (or a stdin script) inside the WSL distro, from Git Bash.
+#
+#   tools/w gg st                 # several args: passed through untouched
+#   tools/w 'gg st | head'        # one arg: a command line, run as written
+#   tools/w <<'EOF'               # a whole script: no quoting layers at all
+#   gg df; ls ~/gg/img
+#   EOF
+#
+# Login shell (PATH from your profile: add <repo>/tools to it), cwd ~/gg, pipefail,
+# UTF-8 output. Never routes through PowerShell or `wsl.exe -e bash -c "..."`,
+# which is where the quoting and UTF-16 mojibake came from.
+set -u
+DISTRO="${GG_DISTRO:-Ubuntu}"
+export WSL_UTF8=1
+# Git Bash rewrites /mnt/... args into C:/Program Files/Git/mnt/...; this
+# script passes everything through stdin, but child calls inherit this too.
+export MSYS_NO_PATHCONV=1
+if [ $# -eq 1 ]; then
+  # one argument = a whole command line, run as written (tools/w 'a | b')
+  printf 'cd ${GG_HOME:-~/gg} 2>/dev/null; set -o pipefail; %s\n' "$1" | wsl.exe -d "$DISTRO" -e bash -ls
+elif [ $# -gt 1 ]; then
+  # %q keeps each argument intact across the hop
+  printf 'cd ${GG_HOME:-~/gg} 2>/dev/null; set -o pipefail; %s\n' "$(printf '%q ' "$@")" \
+    | wsl.exe -d "$DISTRO" -e bash -ls
+else
+  { printf 'cd ${GG_HOME:-~/gg} 2>/dev/null; set -o pipefail\n'; cat; } | wsl.exe -d "$DISTRO" -e bash -ls
+fi

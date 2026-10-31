@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Run one shell command on the guest's single-user serial console and print its
+# output without the kernel/launchd chatter that shares the console.
+#   gsh 'sw_vers'            gsh -t 300 'long command'
+set -u
+T=180
+[ "${1:-}" = -t ] && { T=$2; shift 2; }
+GG=${GG_HOME:-$HOME/gg}
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+python3 "$HERE/27on86/serial-command.py" "$GG/run/${GG_IMG:-gg27}/serial.sock" "$1" --timeout "$T" 2>&1 |
+  grep -av -E 'nx_volume_group_update|triggered unnest of range|^com\.apple\.xpc\.launchd\||Couldn.t alloc class|AppleCredentialManager|^\s*$'

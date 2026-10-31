@@ -1,0 +1,29 @@
+# images, firmware and guest state (never commit Apple software)
+*.raw
+*.img
+*.qcow2
+*.asif
+*.bin
+*.i64
+*.idb
+*.dmg
+*.ipsw
+*.im4p
+*kernelcache*
+*.mem
+# logs and dumps
+*.log
+*.spv
+*.air
+*.spvasm
+serial.txt
+# build outputs and caches
+__pycache__/
+*.pyc
+target/
+build/
+/venv/
+# local state
+.claude/
+CLAUDE.md
+scratch/

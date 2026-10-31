@@ -1,0 +1,8 @@
+[submodule "external/orchard"]
+	path = external/orchard
+	url = https://github.com/JeanxPereira/orchard.git
+	branch = gg-macos27
+[submodule "external/metal2vulkan"]
+	path = external/metal2vulkan
+	url = https://github.com/JeanxPereira/metal2vulkan.git
+	branch = gg-macos27

@@ -1,0 +1,5 @@
+# Pinned submodule commits (path  commit  branch  upstream base).
+# scripts/add-submodules.sh reads this file to record the gitlinks; setup.sh uses it as a
+# fallback to clone at exactly these commits when the gitlinks are not there yet.
+external/orchard       5f8b98515cb998385068dbff036a460752f99790  gg-macos27  yaelliethy/orchard@c73a2bda1fd4afefd61204bb74afd74292ef2fe9 (+100 commits)
+external/metal2vulkan  6b7ea34e5267ad184fa25cafbb101b57e80394fd  gg-macos27  steelbrain/metal2vulkan@9e0e99a41dc3cb8bb7e288b531f1698a79fd4b1c (+9 commits)

@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+# gg — one entry point for the Golden Gate VM inside WSL.
+#
+# Layout (keep all of it on WSL ext4, never on /mnt/<drive>):
+#   <repo>/external/orchard   Orchard (QEMU + reims-vgpu), built in qemu/build (GG_SRC overrides)
+#   $GG_HOME (default ~/gg):
+#     img/<name>/          read-only base: disk.raw aux.img config.json AVPBooter.patched.bin
+#                          + configured.qcow2 (over disk.raw; built by `gg provision`, chmod 444)
+#     run/<name>/          per-image runtime: overlay.qcow2 serial.txt qemu.log qmp.sock pids
+#     cache/               downloads in flight; `gg gc` empties it
+#     opt/mesa-kisak/      private Mesa used by QEMU only (GG_MESA overrides)
+#     ssh/gg_ed25519       key installed into the guest by `gg provision`
+#     venv/                Python venv for the image tools (GG_PY overrides)
+#
+# Root disk chain: disk.raw <- configured.qcow2 <- run/overlay.qcow2. The overlay is a
+# THROWAWAY recreated on every boot, so a crashed experiment costs nothing; GG_KEEP=1
+# keeps it across boots. GG_ROOT=<qcow2> boots that file directly (no overlay).
+#
+# Processes are tracked by pidfile, never by `pkill -f` (which matches the
+# caller's own command line and has killed our shells before).
+set -u
+GG=${GG_HOME:-$HOME/gg}
+T=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)   # this tools/ directory
+REPO=$(cd "$T/.." && pwd)
+IMG_NAME=${GG_IMG:-gg27}
+SRC=${GG_SRC:-$REPO/external/orchard/qemu}
+MESA=${GG_MESA:-$GG/opt/mesa-kisak}
+QEMU=${QEMU:-$SRC/build/qemu-system-aarch64}
+I=$GG/img/$IMG_NAME
+R=$GG/run/$IMG_NAME
+CONF=$I/configured.qcow2
+Q=$R/qmp.sock
+PY=${GG_PY:-$GG/venv/bin/python}
+[ -x "$PY" ] || PY=python3
+SSH_OPTS=(-p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+          -o ConnectTimeout=${GG_SSH_TIMEOUT:-60} -o LogLevel=ERROR)
+# (ssh keeps the FIRST value of an option, so callers cannot override these with -o)
+
+die() { echo "gg: $*" >&2; exit 1; }
+alive() { [ -f "$R/$1.pid" ] && kill -0 "$(cat "$R/$1.pid")" 2>/dev/null; }
+hmp() { "$PY" "$T/qmp.py" "$Q" "$@"; }
+
+ecid() {
+  "$PY" - "$I/config.json" <<'PY'
+import base64, json, plistlib, sys
+print(plistlib.loads(base64.b64decode(json.load(open(sys.argv[1]))["ecid"]))["ECID"])
+PY
+}
+
+set_vkenv() {  # fills the global vkenv=() for GG_VK (see cmd_up)
+  vkenv=()
+  case ${GG_VK:-dzn-kisak} in
+    system) ;;
+    lvp-kisak|dzn-kisak) local mk=$MESA vk=${GG_VK:-dzn-kisak}
+      [ -e "$mk/${vk%-kisak}_icd.json" ] || die "missing $mk/${vk%-kisak}_icd.json"
+      vkenv=(VK_DRIVER_FILES="$mk/${vk%-kisak}_icd.json"
+             LD_LIBRARY_PATH="$mk/usr/lib/x86_64-linux-gnu:/usr/lib/wsl/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}");;
+    *) die "GG_VK must be dzn-kisak, lvp-kisak or system";;
+  esac
+}
+
+# The reims window is winit: Wayland when WAYLAND_DISPLAY names a live socket, else X11
+# (DISPLAY). WSLg's socket lives in /mnt/wslg/runtime-dir and reaches $XDG_RUNTIME_DIR only
+# through a symlink WSL makes at login; a session without it (root, a fresh user tmpfs) gets
+# no Wayland, so point WAYLAND_DISPLAY at the socket itself (libwayland takes absolute paths).
+win_env() {
+  local rt=/mnt/wslg/runtime-dir
+  if [ ! -S "${XDG_RUNTIME_DIR:-/nonexistent}/${WAYLAND_DISPLAY:-wayland-0}" ] && [ -S "$rt/wayland-0" ]; then
+    export WAYLAND_DISPLAY=$rt/wayland-0
+  fi
+  [ -n "${DISPLAY:-}" ] || export DISPLAY=:0
+}
+
+# Does WSLg show a new window at all? Seen once: after a monitor was plugged and unplugged
+# Weston kept accepting clients but never mapped them: vkcube on
+# Wayland and X11 alike got no wl_surface.enter and no frame callback, msrdc made no window,
+# and the reims window ran 20 min "presenting" into nothing. Only a WSLg restart clears it.
+cmd_winprobe() {
+  set_vkenv; win_env
+  command -v vkcube-wayland >/dev/null || { echo "winprobe: vkcube-wayland missing (vulkan-tools)"; return 0; }
+  local t; t=$(mktemp)
+  WAYLAND_DEBUG=1 timeout 6 env "${vkenv[@]}" vkcube-wayland --c 100000 >"$t" 2>&1
+  if grep -qE 'wl_surface@[0-9]+\.enter\(' "$t" ||
+     awk '/wl_surface@[0-9]+\.frame\(new id wl_callback@/ { match($0, /wl_callback@[0-9]+/); f[substr($0, RSTART, RLENGTH)] = 1 }
+          /wl_callback@[0-9]+\.done/ { match($0, /wl_callback@[0-9]+/); if (substr($0, RSTART, RLENGTH) in f) ok = 1 }
+          END { exit !ok }' "$t"; then
+    echo "winprobe: WSLg maps windows (WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-})"
+  else
+    echo "winprobe: WSLg is NOT mapping windows (no surface enter / frame callback in 6 s)."
+    echo "  The reims window will be invisible. Restart WSLg: from Windows, 'wsl --shutdown'"
+    echo "  (stops every distro, this VM included), then re-mount the data disk"
+    echo "  (Start-ScheduledTask 'GG mount data disk' if you used tools/setup-data-vhd.ps1)."
+  fi
+  rm -f "$t"
+}
+
+cmd_up() {   # gg up [--fresh] [--gdb] [--paused] [--window] [-- extra qemu args]
+  local fresh=0 gdb=0 window=0 paused=0
+  while [ $# -gt 0 ]; do case $1 in
+    --fresh) fresh=1;; --gdb) gdb=1;; --paused) paused=1; gdb=1;; --window) window=1;;
+    --) shift; break;; *) break;; esac; shift; done
+  alive qemu && die "already running (pid $(cat "$R/qemu.pid")); gg stop first"
+  for f in "$QEMU" "$I/disk.raw" "$I/aux.img" "$I/AVPBooter.patched.bin"; do [ -e "$f" ] || die "missing $f"; done
+  mkdir -p "$R"
+  local root=$R/overlay.qcow2
+  if [ -n "${GG_ROOT:-}" ]; then
+    root=$GG_ROOT                                  # a layer booted directly (gg provision)
+  else                                             # throwaway; --fresh beats GG_KEEP=1
+    { [ "${GG_KEEP:-0}" = 1 ] && [ $fresh = 0 ]; } || rm -f "$root"
+    if [ ! -e "$root" ]; then
+      if [ -e "$CONF" ]; then qemu-img create -q -f qcow2 -F qcow2 -b "$CONF" "$root"
+      else qemu-img create -q -f qcow2 -F raw -b "$I/disk.raw" "$root"; fi
+    fi
+  fi
+  echo "$root" > "$R/root.path"
+  rm -f "$R/serial.txt" "$R/qemu.log" "$Q" "$R/serial.sock"
+  local extra=()
+  [ $gdb = 1 ] && extra+=(-gdb tcp:127.0.0.1:1234)
+  [ $paused = 1 ] && extra+=(-S)   # wait for gdb (boot-args injection, `gg bootargs`)
+  if [ $window = 1 ]; then export REIMS_VGPU_WINDOW=1; else export REIMS_VGPU_WINDOW=0; fi  # closing the window powers the VM off
+  # GG_VK=dzn-kisak (default)|lvp-kisak|system: private Mesa (opt/mesa-kisak) for QEMU only.
+  # Dozen (Vulkan on D3D12) is the default: llvmpipe, system or kisak, aborts with
+  # "Cannot emit physreg copy" ~3 min in; dzn reaches the desktop.
+  set_vkenv
+  [ $window = 1 ] && { win_env; [ "${GG_WINPROBE:-1}" = 1 ] && cmd_winprobe >&2; }
+  # No core dumps: WSL copies each one (~guest RAM, 8 GB) to %TEMP%\wsl-crashes on the
+  # Windows system drive, and a day of aborts fills it. The host log says why it died.
+  ulimit -c 0
+  # /tmp is wiped by `wsl --shutdown`; keep every host GPU log of a run on the data disk.
+  mkdir -p "$R/logs"
+  for f in /tmp/reims-vgpu-fail*.log; do [ -s "$f" ] && cp -n "$f" "$R/logs/$(date -r "$f" +%Y%m%d-%H%M%S)-${f##*/}"; done
+  # setsid: a plain `( … ) &` dies with the wsl.exe session that ran `gg up`.
+  L="$R/logs" setsid bash -c 'while sleep 300; do [ -s /tmp/reims-vgpu-fail.log ] || continue
+      cp /tmp/reims-vgpu-fail.log "$L/current.log.tmp" && mv "$L/current.log.tmp" "$L/current.log"
+      pgrep -x qemu-system-aar >/dev/null || break; done' >/dev/null 2>&1 < /dev/null &
+  setsid env "${vkenv[@]}" "$QEMU" -M apple-vm,uuid="$(ecid)" \
+    -accel tcg,thread=multi,tb-size=2048 -m "${RAM:-6G}" -smp "${CPUS:-12}" \
+    -bios "$I/AVPBooter.patched.bin" \
+    -drive file="$I/aux.img",if=pflash,format=raw \
+    -drive file="$I/disk.raw",if=pflash,format=raw,readonly=on \
+    -drive file="$I/aux.img",if=none,id=aux,format=raw \
+    -device vmapple-virtio-blk-pci,variant=aux,drive=aux,share-rw=on \
+    -drive file="$root",if=none,id=root,format=qcow2,cache=writeback,aio=threads,discard=unmap \
+    -device vmapple-virtio-blk-pci,variant=root,drive=root \
+    -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22 -device virtio-net-pci,netdev=net0 \
+    -chardev socket,id=ser0,path="$R/serial.sock",server=on,wait=off,logfile="$R/serial.txt" \
+    -serial chardev:ser0 -qmp unix:"$Q",server=on,wait=off -display none \
+    -pidfile "$R/qemu.pid" -d unimp,guest_errors -D "$R/qemu.log" \
+    "${extra[@]}" "$@" > "$R/qemu.out" 2>&1 < /dev/null &
+  sleep 2; alive qemu || { cat "$R/qemu.out"; die "qemu did not start"; }
+  echo "qemu up: pid $(cat "$R/qemu.pid"), run dir $R, root $root"
+  echo "  backing: $(qemu-img info -U "$root" | sed -n 's/^backing file: //p')"
+}
+
+# Boot with XNU boot-args injected at the iBoot->XNU handoff (NVRAM boot-args are
+# filtered to -v under full security). 0xE0A00000 measured on macOS 27 26A428, 6G RAM.
+# CSR 0x2 (CSR_ALLOW_UNRESTRICTED_FS) lets the guest edit SIP-protected files such
+# as launchd's disabled.plist; GG_CSR overrides it.
+boot_injected() {  # boot_injected '<boot-args>'
+  cmd_stop >/dev/null 2>&1
+  # GG_WINDOW=1: also open reims' Vulkan window (WSLg) to watch the guest live.
+  cmd_up --paused $([ "${GG_WINDOW:-0}" = 1 ] && echo --window) >/dev/null || die "qemu did not start"
+  ( cd "$T/27on86" && QEMU_27ON86_HANDOFF_PC=${GG_HANDOFF_PC:-0xE0A00000} QEMU_27ON86_GDB_PORT=1234 \
+      QEMU_27ON86_XNU_BOOT_ARGS="$1" QEMU_27ON86_SCRIPT_DIR="$PWD" QEMU_27ON86_CSR_CONFIG=${GG_CSR:-0x2} \
+      timeout 200 gdb-multiarch -nx -q -batch -x inject-xnu-boot-args.gdb 2>&1 | grep -a injected ) ||
+    die "boot-args injection failed (handoff address changed?)"
+}
+
+cmd_single() {   # single-user root shell on the serial, Data volume mounted; drive it with gsh
+  boot_injected '-s -v serial=3 debug=0x14c'
+  for i in $(seq 1 60); do grep -aq -- '-sh-3.2#' "$R/serial.txt" && break; sleep 2; done
+  grep -aq -- '-sh-3.2#' "$R/serial.txt" || die "no single-user prompt"
+  "$T/gsh" -t 60 '(/System/Library/Filesystems/apfs.fs/Contents/Resources/apfs_boot_util 2 >/dev/null 2>&1 &); sleep 1; echo booting data' >/dev/null
+  "$T/gsh" -t 200 'for i in $(seq 1 180); do [ "$(stat -f %d /System/Volumes/Data/private 2>/dev/null)" = "$(stat -f %d /private)" ] && break; sleep 1; done; mount | grep -c " /System/Volumes/Data "' | tail -1 | grep -q 1 ||
+    die "Data volume did not mount"
+  echo "single-user ready: gsh '<cmd>'"
+}
+
+cmd_verbose() {  # normal boot with kernel/launchd log (and GGTEL telemetry) on the serial
+  # Protocol rung 237 is what the macOS 27 guest driver needs for the full feature set;
+  # `gg provision` exports 4 before calling this (GPU driver kept down while the layer is writable).
+  export REIMS_VGPU_PROTOCOL_CAP=${REIMS_VGPU_PROTOCOL_CAP:-237}
+  boot_injected '-v serial=3 debug=0x14c'
+  echo "verbose boot started: gg serial"
+}
+
+# --- gg provision: rebuild configured.qcow2 from disk.raw, reproducibly ----------------
+# Phase 1 (`gg provision`, ~3 min): new layer, single-user edits through gsh, halt, then a
+# normal boot ON the layer itself. Phase 2 (`gg provision finish`, rerun until it seals; the
+# first boot converges in 6-10 min): wait for SSH, clean guest shutdown, chmod 444.
+gput() {  # gput <host file> <guest path>: base64 over the serial, 512-char lines
+  "$T/gsh" -t 60 "rm -f '$2.b64'" >/dev/null
+  base64 -w 512 "$1" | while IFS= read -r l; do
+    "$T/gsh" -t 60 "echo '$l' >> '$2.b64'" >/dev/null < /dev/null; done
+  local n; n=$("$T/gsh" -t 60 "base64 -D -i '$2.b64' -o '$2' && rm '$2.b64' && echo GPUT=\$(wc -c < '$2')" |
+    sed -n 's/^GPUT= *\([0-9]*\).*/\1/p' | tail -1)
+  [ "$n" = "$(wc -c < "$1")" ] || die "gput $1 -> $2: $n bytes in the guest"
+}
+
+provision_guest() {  # the guest configuration, applied on /System/Volumes/Data
+  local D=/System/Volumes/Data
+  "$T/gsh" -t 120 "P=$D/private/var/db/com.apple.xpc.launchd/disabled.plist; B=/usr/libexec/PlistBuddy
+    for l in com.apple.metadata.mds com.apple.metadata.mds.index com.apple.metadata.mds.scan \\
+             com.apple.metadata.mds.spindump com.apple.triald.system; do   # true = disabled
+      \$B -c \"Add :\$l bool true\" \$P 2>/dev/null || \$B -c \"Set :\$l true\" \$P; done
+    \$B -c 'Set :com.openssh.sshd false' \$P 2>/dev/null || \$B -c 'Add :com.openssh.sshd bool false' \$P
+    touch $D/.metadata_never_index
+    mkdir -p $D/private/var/root/.ssh $D/Users/admin/.ssh $D/usr/local/gg"
+  gput "$GG/ssh/gg_ed25519.pub" $D/private/var/root/.ssh/authorized_keys
+  gput "$T/../guest/gg-telemetry.sh" $D/usr/local/gg/gg-telemetry.sh
+  gput "$T/../guest/org.gg.telemetry.plist" $D/Library/LaunchDaemons/org.gg.telemetry.plist
+  # short commands: a long line can lose a character on the UART while the console is busy
+  "$T/gsh" -t 60 "cp $D/private/var/root/.ssh/authorized_keys $D/Users/admin/.ssh/"
+  "$T/gsh" -t 60 "chown -R 0:0 $D/private/var/root/.ssh; chown -R 501:20 $D/Users/admin/.ssh"
+  "$T/gsh" -t 60 "chmod 700 $D/private/var/root/.ssh $D/Users/admin/.ssh"
+  "$T/gsh" -t 60 "chmod 600 $D/private/var/root/.ssh/authorized_keys $D/Users/admin/.ssh/authorized_keys"
+  "$T/gsh" -t 60 "chown -R 0:0 $D/usr/local/gg; chmod 755 $D/usr/local/gg/gg-telemetry.sh"
+  "$T/gsh" -t 60 "cd $D/Library/LaunchDaemons; chown 0:0 org.gg.telemetry.plist; chmod 644 org.gg.telemetry.plist; cd /"
+  "$T/gsh" -t 120 "sync; echo synced"
+  "$T/gsh" -t 60 "/usr/libexec/PlistBuddy -c Print $D/private/var/db/com.apple.xpc.launchd/disabled.plist | grep -E 'mds|triald|sshd'"
+  "$T/gsh" -t 60 "ls -lan $D/.metadata_never_index $D/private/var/root/.ssh $D/Users/admin/.ssh" | grep -v failed
+  "$T/gsh" -t 60 "ls -lan $D/usr/local/gg $D/Library/LaunchDaemons/org.gg.telemetry.plist" | grep -v failed
+}
+
+wait_exit() {  # wait_exit <secs>: true once QEMU has exited by itself
+  local t=$((SECONDS + $1)); while alive qemu && [ $SECONDS -lt $t ]; do sleep 3; done; ! alive qemu
+}
+
+cmd_provision() {  # gg provision | gg provision finish
+  if [ "${1:-}" = finish ]; then
+    [ "$(cat "$R/root.path" 2>/dev/null)" = "$CONF" ] && alive qemu || die "no provisioning boot running"
+    local t=$((SECONDS + ${GG_WAIT:-280}))
+    until GG_SSH_TIMEOUT=20 cmd_ssh true 2>/dev/null; do
+      [ $SECONDS -lt $t ] || die "no SSH yet ($(date +%T)); first boot still converging: rerun gg provision finish"
+      sleep 10; done
+    echo "$(date +%T) SSH up; clean shutdown"
+    cmd_ssh 'echo admin | sudo -S shutdown -h now' 2>&1 | tail -2
+    if wait_exit 180; then echo "guest shut down cleanly"
+    else hmp system_powerdown >/dev/null; wait_exit 60 && echo "guest powered down (system_powerdown)" ||
+      { cmd_stop; echo "WARNING: had to kill QEMU; configured.qcow2 may not be clean"; }; fi
+    rm -f "$R/root.path"; chmod 444 "$CONF"
+    qemu-img info --backing-chain "$CONF" | grep -E '^(image|file format|disk size|backing file)'
+    return
+  fi
+  alive qemu && die "running (pid $(cat "$R/qemu.pid")); gg stop first"
+  [ -e "$CONF" ] && { mv "$CONF" "$CONF.$(date +%Y%m%d-%H%M%S)"; echo "old layer kept as $CONF.<stamp>"; }
+  qemu-img create -q -f qcow2 -F raw -b "$I/disk.raw" "$CONF" || die "qemu-img create failed"
+  export GG_ROOT=$CONF
+  # Protocol cap 4 keeps the guest GPU driver down: no shaders reach llvmpipe, whose aborts
+  # ("LLVM ERROR: Cannot emit physreg copy") must not hit the layer while it is writable.
+  export REIMS_VGPU_PROTOCOL_CAP=${GG_PROV_CAP:-4}
+  echo "$(date +%T) single-user on $CONF"; cmd_single
+  provision_guest
+  # ^C first: gets the shell out of a continuation prompt if a quote got lost on the UART
+  echo "$(date +%T) halt"
+  python3 -c 'import socket,sys,time; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1])
+s.sendall(b"\x03\n"); time.sleep(1); s.sendall(b"sync; sync; halt\n"); time.sleep(1)' "$R/serial.sock"
+  wait_exit 90 && echo "halted" || { cmd_stop >/dev/null; echo "WARNING: halt did not stop QEMU; killed"; }
+  echo "$(date +%T) first normal boot on the layer"; cmd_verbose
+  echo "next: gg provision finish   (rerun until it seals the layer)"
+}
+
+cmd_stop() {
+  for p in qemu; do alive $p && kill "$(cat "$R/$p.pid")" 2>/dev/null; done
+  sleep 2
+  for p in qemu; do alive $p && kill -9 "$(cat "$R/$p.pid")"; rm -f "$R/$p.pid"; done
+  echo stopped
+}
+
+cmd_st() {   # one-screen status
+  echo "root: $(cat "$R/root.path" 2>/dev/null)"
+  echo "image $IMG_NAME  qemu: $(alive qemu && echo "up pid $(cat "$R/qemu.pid")" || echo down)"
+  alive qemu || return 0
+  hmp "info status" | tail -n +2
+  echo "iBoot stage1 count: $(grep -ac 'Start of iBootStage1' "$R/serial.txt" 2>/dev/null)"
+  echo "-- cpu PCs"; hmp "info registers -a" | grep -o 'PC=[0-9a-f]*' | sort | uniq -c | head
+  echo "-- serial tail"; tail -n "${N:-5}" "$R/serial.txt" 2>/dev/null
+}
+
+cmd_ssh() {  # gg ssh [command]   (key from ~/gg/ssh if present, else password)
+  # -n: never read our stdin. Scripts reach WSL through stdin (tools/w), and an ssh
+  # that reads it swallows every line after it. GG_SSH_STDIN=1 to pipe data in.
+  local key=$GG/ssh/gg_ed25519 n=-n
+  [ "${GG_SSH_STDIN:-0}" = 1 ] && n=
+  if [ -f "$key" ]; then
+    ssh $n "${SSH_OPTS[@]}" -i "$key" -o BatchMode=yes "${GG_USER:-admin}@127.0.0.1" "$@"
+  else
+    sshpass -p "${GG_PASS:-admin}" ssh $n "${SSH_OPTS[@]}" "${GG_USER:-admin}@127.0.0.1" "$@"
+  fi
+}
+
+cmd_df() {
+  df -h / "$GG"/img/ "$GG"/run/ 2>/dev/null | awk '!seen[$0]++'
+  du -sh "$GG"/{img,run,cache}/ 2>/dev/null
+  echo "-- images"; for d in "$GG"/img/*/; do [ -d "$d" ] && echo "$(du -sh "$d" | cut -f1) apparent $(du -sh --apparent-size "$d" | cut -f1)  $d"; done
+}
+
+cmd_gc() {   # drop regenerable stuff
+  rm -rf "$GG/cache"/* ; rm -f "$GG"/run/*/qemu.log "$GG"/run/*/*.mem "$GG"/run/*/*.bin
+  cmd_df
+}
+
+case "${1:-help}" in
+  up|stop|st|ssh|df|gc|single|verbose|provision|winprobe) c=$1; shift; "cmd_$c" "$@";;
+  hmp)    shift; hmp "$@";;
+  serial) shift; tail -n "${1:-40}" "$R/serial.txt";;
+  con)    exec socat -,raw,echo=0 UNIX-CONNECT:"$R/serial.sock";;   # interactive serial
+  log)    tail -n "${2:-40}" "$R/qemu.log";;
+  *) sed -n '2,20p' "$0"; echo "commands: up [--fresh --gdb --paused --window] | single | verbose | provision [finish] | stop | st | hmp <cmd>... | serial [n] | con | ssh [cmd] | log | df | gc | winprobe";;
+esac
